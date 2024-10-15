@@ -1,7 +1,8 @@
-use std::{sync::Mutex, time::Duration};
+use std::{fs, sync::Mutex};
 
+use image::GenericImageView;
 use tauri::{async_runtime::block_on, AppHandle, Manager, PhysicalSize, RunEvent, WindowEvent};
-use tokio::time::sleep;
+use tokio::time::{sleep_until, Duration, Instant};
 use wgpu::{include_wgsl, util::DeviceExt as _};
 
 // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
@@ -14,29 +15,33 @@ fn greet(name: &str) -> String {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
     position: [f32; 3],
-    color: [f32; 3],
+    tex_coords: [f32; 2],
 }
 
 const VERTICES: &[Vertex] = &[
     Vertex {
         position: [-0.45, 0.9, 0.0],
-        color: [0.5, 0.5, 0.5],
+        tex_coords: [0.0, 0.0],
     },
     Vertex {
         position: [-0.45, 0.0, 0.0],
-        color: [0.3, 0.3, 0.3],
+        tex_coords: [0.0, 1.0],
     },
     Vertex {
         position: [0.45, 0.0, 0.0],
-        color: [0.5, 0.5, 0.5],
+        tex_coords: [1.0, 1.0],
     },
     Vertex {
         position: [0.45, 0.9, 0.0],
-        color: [0.7, 0.7, 0.7],
+        tex_coords: [1.0, 0.0],
     },
 ];
 
 const INDICES: &[u16] = &[0, 1, 2, 0, 2, 3];
+
+const NUM_FRAMES: u32 = 11;
+// current limit seems to be ~10ms
+const FRAME_RATE: Duration = Duration::from_millis(100);
 
 struct GpuState<'a> {
     surface: wgpu::Surface<'a>,
@@ -46,6 +51,11 @@ struct GpuState<'a> {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    diffuse_bind_group: wgpu::BindGroup,
+    diffuse_texture: wgpu::Texture,
+    texture_size: wgpu::Extent3d,
+    frame_idx: Option<u32>,
+    start_time: Option<Instant>,
 }
 
 // TODO
@@ -53,10 +63,11 @@ struct GpuState<'a> {
 //  - create components around the video player that do not have transparent backgrounds
 //
 // IDEAS:
-//  - add text input boxes to set min/max threshold and change to blue/red if pixels ar
+//  - add text input boxes to set min/max threshold and change to blue/red if pixels are
 //    darker/brighter than the threshold. Might need to make the image greyscale to do this
-//  - Set a default texture when video is not playing
-//  - Vary the image over time, or find some other images to shuffle through
+//  - Set up tauri command to allow stopping the video
+//  - instead of looping inside the command, create another task that just sends the next frame idx
+//    periodically according to the frame rate
 //  ? make some resizable component in the FE, send the size and position down to rust, have that
 //    control where the video is rendered in the shader
 
@@ -65,6 +76,8 @@ fn next_triangle(app_handle: &AppHandle, new_size: Option<PhysicalSize<u32>>) {
 
     {
         let mut gpu_state = gpu_state_mutex.lock().unwrap();
+
+        // check and see if reconfig is needed
         if let Some(new_size) = new_size {
             gpu_state.config.width = if new_size.width > 0 {
                 new_size.width
@@ -80,6 +93,53 @@ fn next_triangle(app_handle: &AppHandle, new_size: Option<PhysicalSize<u32>>) {
                 .surface
                 .configure(&gpu_state.device, &gpu_state.config);
         }
+
+        // update frame idx if necessary
+        let next_frame_idx = if let Some(start_time) = gpu_state.start_time {
+            let whole_periods_elapsed =
+                Instant::now().duration_since(start_time).as_millis() / FRAME_RATE.as_millis();
+            let next_frame_idx = (whole_periods_elapsed % (NUM_FRAMES as u128)) as u32;
+            // TODO remove debug
+            if let Some(frame_idx) = gpu_state.frame_idx {
+                if next_frame_idx != frame_idx && next_frame_idx > (frame_idx + 1) % NUM_FRAMES {
+                    println!("\n\n------------- DROP ---------------\n\n")
+                }
+            }
+            Some(next_frame_idx)
+        } else {
+            None
+        };
+
+        if next_frame_idx != gpu_state.frame_idx {
+            gpu_state.frame_idx = next_frame_idx;
+            let img_name = if let Some(frame_idx) = next_frame_idx {
+                // println!("!!! Frame {}", frame_idx); // TODO remove debug
+                format!("happy-tree-{}", frame_idx + 1)
+            } else {
+                "default".to_string()
+            };
+            let diffuse_bytes =
+                fs::read(format!("./video-imgs/{}.png", img_name)).expect("should read");
+            let diffuse_image = image::load_from_memory(&diffuse_bytes).unwrap();
+            let diffuse_rgba = diffuse_image.to_rgba8();
+            gpu_state.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &gpu_state.diffuse_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &diffuse_rgba,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * gpu_state.texture_size.width),
+                    rows_per_image: Some(gpu_state.texture_size.height),
+                },
+                gpu_state.texture_size,
+            );
+        }
+
+        // render
         let frame = gpu_state
             .surface
             .get_current_texture()
@@ -106,17 +166,7 @@ fn next_triangle(app_handle: &AppHandle, new_size: Option<PhysicalSize<u32>>) {
                 occlusion_query_set: None,
             });
             rpass.set_pipeline(&gpu_state.render_pipeline);
-            // let now = (SystemTime::now()
-            //     .duration_since(SystemTime::UNIX_EPOCH)
-            //     .expect("failed getting dur since")
-            //     .as_secs()
-            //     % 4) as u32;
-            // let r = Range {
-            //     start: now,
-            //     end: now + 3,
-            // };
-            // rpass.draw(r, 0..1);
-
+            rpass.set_bind_group(0, &gpu_state.diffuse_bind_group, &[]);
             rpass.set_vertex_buffer(0, gpu_state.vertex_buffer.slice(..));
             rpass.set_index_buffer(gpu_state.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             rpass.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
@@ -129,9 +179,22 @@ fn next_triangle(app_handle: &AppHandle, new_size: Option<PhysicalSize<u32>>) {
 
 #[tauri::command]
 async fn hello_triangle(app_handle: AppHandle) {
+    let gpu_state_mutex = app_handle.state::<Mutex<GpuState>>();
+    let now = Instant::now();
+    {
+        let mut gpu_state = gpu_state_mutex.lock().unwrap();
+        gpu_state.start_time = Some(now);
+    }
+
+    let mut deadline = now;
     loop {
+        // TODO not sure if this will handle dropped frames correctly, but not important since this
+        // should eventually be removed
+        let start = Instant::now();
         next_triangle(&app_handle, None);
-        sleep(Duration::from_secs(1)).await;
+        // println!("$$$ {}", (Instant::now() - start).as_micros()); // TODO remove debug
+        deadline += FRAME_RATE;
+        sleep_until(deadline).await;
     }
 }
 
@@ -187,7 +250,7 @@ pub fn run() {
                     wgpu::VertexAttribute {
                         offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                         shader_location: 1,
-                        format: wgpu::VertexFormat::Float32x3,
+                        format: wgpu::VertexFormat::Float32x2,
                     },
                 ],
             };
@@ -198,9 +261,98 @@ pub fn run() {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
+            let texture_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                multisampled: false,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            // This should match the filterable field of the
+                            // corresponding Texture entry above.
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                    label: Some("texture_bind_group_layout"),
+                });
+
+            let diffuse_bytes = fs::read("./video-imgs/default.png").expect("should read");
+            let diffuse_image = image::load_from_memory(&diffuse_bytes).unwrap();
+            let dimensions = diffuse_image.dimensions();
+
+            let texture_size = wgpu::Extent3d {
+                width: dimensions.0,
+                height: dimensions.1,
+                depth_or_array_layers: 1,
+            };
+            let diffuse_texture = device.create_texture(&wgpu::TextureDescriptor {
+                size: texture_size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                label: Some("diffuse_texture"),
+                view_formats: &[],
+            });
+
+            let diffuse_texture_view =
+                diffuse_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let diffuse_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Nearest,
+                mipmap_filter: wgpu::FilterMode::Nearest,
+                ..Default::default()
+            });
+
+            let diffuse_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&diffuse_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&diffuse_sampler),
+                    },
+                ],
+                label: Some("diffuse_bind_group"),
+            });
+
+            let diffuse_rgba = diffuse_image.to_rgba8();
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &diffuse_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &diffuse_rgba,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * dimensions.0),
+                    rows_per_image: Some(dimensions.1),
+                },
+                texture_size,
+            );
+
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[],
+                bind_group_layouts: &[&texture_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -267,9 +419,10 @@ pub fn run() {
                 });
 
                 rpass.set_pipeline(&render_pipeline);
+                rpass.set_bind_group(0, &diffuse_bind_group, &[]);
                 rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 rpass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-                rpass.draw_indexed(0..1, 0, 0..1);
+                rpass.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
             }
 
             queue.submit(Some(encoder.finish()));
@@ -283,6 +436,11 @@ pub fn run() {
                 render_pipeline,
                 vertex_buffer,
                 index_buffer,
+                diffuse_bind_group,
+                diffuse_texture,
+                texture_size,
+                frame_idx: None,
+                start_time: None,
             };
 
             app.manage(Mutex::new(gpu_state));
