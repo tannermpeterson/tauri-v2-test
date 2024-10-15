@@ -24,6 +24,7 @@ function App() {
   function onLiveViewClick() {
     if (liveViewRunning) {
       stopLiveView();
+      // TODO reset the threshold values here
     } else {
       startLiveView();
     }
@@ -38,24 +39,24 @@ function App() {
       <div className="row" style={{height: "300px"}}>
       </div>
 
-      <h1>Welcome to Tauri!</h1>
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-
-      <p>{greetMsg}</p>
       <button onClick={onLiveViewClick}>{liveViewBtnText}</button>
+
+        <div class="row">
+          <h2>Min:</h2>
+          <input
+            id="min-video-threshold"
+            onChange={(e) => invoke("set_min_threshold", { newMinThreshold: parseInt(e.currentTarget.value)})}
+            placeholder="0"
+          />
+        </div>
+        <div class="row">
+          <h2>Max:</h2>
+          <input
+            id="max-video-threshold"
+            onChange={(e) => invoke("set_max_threshold", { newMaxThreshold: parseInt(e.currentTarget.value)})}
+            placeholder="100"
+          />
+        </div>
     </div>
   );
 }

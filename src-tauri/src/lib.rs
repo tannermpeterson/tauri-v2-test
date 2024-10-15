@@ -3,7 +3,7 @@ use std::{fs, sync::Mutex};
 use image::GenericImageView;
 use tauri::{async_runtime::block_on, AppHandle, Manager, PhysicalSize, RunEvent, WindowEvent};
 use tokio::time::{sleep_until, Duration, Instant};
-use wgpu::{include_wgsl, util::DeviceExt as _};
+use wgpu::{include_wgsl, util::DeviceExt as _, BufferBindingType};
 
 // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
 #[tauri::command]
@@ -56,6 +56,10 @@ struct GpuState<'a> {
     texture_size: wgpu::Extent3d,
     frame_idx: Option<u32>,
     start_time: Option<Instant>,
+    min_threshold: u32,
+    max_threshold: u32,
+    threshold_buffer: wgpu::Buffer,
+    threshold_bind_group: wgpu::BindGroup,
 }
 
 // TODO
@@ -103,14 +107,14 @@ fn next_triangle(app_handle: &AppHandle, new_size: Option<PhysicalSize<u32>>) ->
             // TODO remove debug
             if let Some(frame_idx) = gpu_state.frame_idx {
                 if next_frame_idx != frame_idx && next_frame_idx > (frame_idx + 1) % NUM_FRAMES {
-                    println!("\n\n------------- DROP ---------------\n\n")
+                    println!("\n\n------------- FRAME(S) DROPPED -------------\n\n")
                 }
             }
             Some(next_frame_idx)
         } else {
             None
         };
-
+        // if on a new frame idx, update the image
         if next_frame_idx != gpu_state.frame_idx {
             gpu_state.frame_idx = next_frame_idx;
             let img_name = if let Some(frame_idx) = next_frame_idx {
@@ -138,6 +142,13 @@ fn next_triangle(app_handle: &AppHandle, new_size: Option<PhysicalSize<u32>>) ->
                 gpu_state.texture_size,
             );
         }
+
+        // handle thresholding
+        gpu_state.queue.write_buffer(
+            &gpu_state.threshold_buffer,
+            0,
+            bytemuck::cast_slice(&[gpu_state.min_threshold, gpu_state.max_threshold]),
+        );
 
         // render
         let frame = gpu_state
@@ -167,6 +178,7 @@ fn next_triangle(app_handle: &AppHandle, new_size: Option<PhysicalSize<u32>>) ->
             });
             rpass.set_pipeline(&gpu_state.render_pipeline);
             rpass.set_bind_group(0, &gpu_state.diffuse_bind_group, &[]);
+            rpass.set_bind_group(1, &gpu_state.threshold_bind_group, &[]);
             rpass.set_vertex_buffer(0, gpu_state.vertex_buffer.slice(..));
             rpass.set_index_buffer(gpu_state.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             rpass.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
@@ -204,6 +216,23 @@ async fn stop_live_view(app_handle: AppHandle) {
     let gpu_state_mutex = app_handle.state::<Mutex<GpuState>>();
     let mut gpu_state = gpu_state_mutex.lock().unwrap();
     gpu_state.start_time = None;
+    // TODO make consts for these default values
+    gpu_state.min_threshold = 0;
+    gpu_state.max_threshold = 100;
+}
+
+#[tauri::command]
+async fn set_min_threshold(app_handle: AppHandle, new_min_threshold: u32) {
+    let gpu_state_mutex = app_handle.state::<Mutex<GpuState>>();
+    let mut gpu_state = gpu_state_mutex.lock().unwrap();
+    gpu_state.min_threshold = new_min_threshold;
+}
+
+#[tauri::command]
+async fn set_max_threshold(app_handle: AppHandle, new_max_threshold: u32) {
+    let gpu_state_mutex = app_handle.state::<Mutex<GpuState>>();
+    let mut gpu_state = gpu_state_mutex.lock().unwrap();
+    gpu_state.max_threshold = new_max_threshold;
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -240,6 +269,7 @@ pub fn run() {
             // Load the shaders from disk
             let shader = device.create_shader_module(include_wgsl!("shader.wgsl"));
 
+            // vertex buffer
             let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Vertex Buffer"),
                 contents: bytemuck::cast_slice(VERTICES),
@@ -263,12 +293,14 @@ pub fn run() {
                 ],
             };
 
+            // index buffer
             let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Index Buffer"),
                 contents: bytemuck::cast_slice(INDICES),
                 usage: wgpu::BufferUsages::INDEX,
             });
 
+            // texture
             let texture_bind_group_layout =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     entries: &[
@@ -358,9 +390,44 @@ pub fn run() {
                 texture_size,
             );
 
+            // thresholds
+            let min_threshold: u32 = 0;
+            let max_threshold: u32 = 100;
+
+            let threshold_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Threshold Buffer"),
+                contents: bytemuck::cast_slice(&[min_threshold, max_threshold]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+            let threshold_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                    label: Some("threshold_bind_group_layout"),
+                });
+
+            let threshold_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &threshold_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: threshold_buffer.as_entire_binding(),
+                }],
+                label: Some("camera_bind_group"),
+            });
+
+            // etc.
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[&texture_bind_group_layout],
+                bind_group_layouts: &[&texture_bind_group_layout, &threshold_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -402,6 +469,8 @@ pub fn run() {
 
             surface.configure(&device, &config);
 
+            // TODO could probably just call fn here instead of duping code
+
             let frame = surface
                 .get_current_texture()
                 .expect("Failed to acquire next swap chain texture");
@@ -428,6 +497,7 @@ pub fn run() {
 
                 rpass.set_pipeline(&render_pipeline);
                 rpass.set_bind_group(0, &diffuse_bind_group, &[]);
+                rpass.set_bind_group(1, &threshold_bind_group, &[]);
                 rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 rpass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
                 rpass.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
@@ -449,6 +519,10 @@ pub fn run() {
                 texture_size,
                 frame_idx: None,
                 start_time: None,
+                min_threshold,
+                max_threshold,
+                threshold_buffer,
+                threshold_bind_group,
             };
 
             app.manage(Mutex::new(gpu_state));
@@ -459,7 +533,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             start_live_view,
-            stop_live_view
+            stop_live_view,
+            set_min_threshold,
+            set_max_threshold,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
