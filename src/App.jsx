@@ -1,20 +1,36 @@
 import { useState } from "react";
-import reactLogo from "./assets/react.svg";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
+
+async function startLiveView() {
+  await invoke("start_live_view");
+}
+
+async function stopLiveView() {
+  await invoke("stop_live_view");
+}
+
 
 function App() {
   const [greetMsg, setGreetMsg] = useState("");
   const [name, setName] = useState("");
+  const [liveViewRunning, setLiveViewRunning] = useState(false);
 
   async function greet() {
     // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
     setGreetMsg(await invoke("greet", { name }));
   }
 
-  async function helloTriangle() {
-    await invoke("hello_triangle");
+  function onLiveViewClick() {
+    if (liveViewRunning) {
+      stopLiveView();
+    } else {
+      startLiveView();
+    }
+    setLiveViewRunning(!liveViewRunning);
   }
+
+  const liveViewBtnText = liveViewRunning ? "Stop Live View" : "Start Live View";
 
   return (
     <div className="container">
@@ -39,7 +55,7 @@ function App() {
       </form>
 
       <p>{greetMsg}</p>
-      <button onClick={helloTriangle}>Hello Triangle</button>
+      <button onClick={onLiveViewClick}>{liveViewBtnText}</button>
     </div>
   );
 }

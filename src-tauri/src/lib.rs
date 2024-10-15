@@ -71,9 +71,10 @@ struct GpuState<'a> {
 //  ? make some resizable component in the FE, send the size and position down to rust, have that
 //    control where the video is rendered in the shader
 
-fn next_triangle(app_handle: &AppHandle, new_size: Option<PhysicalSize<u32>>) {
+fn next_triangle(app_handle: &AppHandle, new_size: Option<PhysicalSize<u32>>) -> bool {
     let gpu_state_mutex = app_handle.state::<Mutex<GpuState>>();
 
+    // TODO try removing these inner brackets
     {
         let mut gpu_state = gpu_state_mutex.lock().unwrap();
 
@@ -113,7 +114,6 @@ fn next_triangle(app_handle: &AppHandle, new_size: Option<PhysicalSize<u32>>) {
         if next_frame_idx != gpu_state.frame_idx {
             gpu_state.frame_idx = next_frame_idx;
             let img_name = if let Some(frame_idx) = next_frame_idx {
-                // println!("!!! Frame {}", frame_idx); // TODO remove debug
                 format!("happy-tree-{}", frame_idx + 1)
             } else {
                 "default".to_string()
@@ -174,28 +174,36 @@ fn next_triangle(app_handle: &AppHandle, new_size: Option<PhysicalSize<u32>>) {
 
         gpu_state.queue.submit(Some(encoder.finish()));
         frame.present();
+
+        next_frame_idx.is_some()
     }
 }
 
 #[tauri::command]
-async fn hello_triangle(app_handle: AppHandle) {
+async fn start_live_view(app_handle: AppHandle) {
     let gpu_state_mutex = app_handle.state::<Mutex<GpuState>>();
-    let now = Instant::now();
+    let now: Instant;
     {
         let mut gpu_state = gpu_state_mutex.lock().unwrap();
+        now = Instant::now();
         gpu_state.start_time = Some(now);
     }
 
-    let mut deadline = now;
+    let mut deadline = now + FRAME_RATE;
     loop {
-        // TODO not sure if this will handle dropped frames correctly, but not important since this
-        // should eventually be removed
-        let start = Instant::now();
-        next_triangle(&app_handle, None);
-        // println!("$$$ {}", (Instant::now() - start).as_micros()); // TODO remove debug
-        deadline += FRAME_RATE;
+        if !next_triangle(&app_handle, None) {
+            return;
+        }
         sleep_until(deadline).await;
+        deadline += FRAME_RATE;
     }
+}
+
+#[tauri::command]
+async fn stop_live_view(app_handle: AppHandle) {
+    let gpu_state_mutex = app_handle.state::<Mutex<GpuState>>();
+    let mut gpu_state = gpu_state_mutex.lock().unwrap();
+    gpu_state.start_time = None;
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -448,7 +456,11 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![greet, hello_triangle])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            start_live_view,
+            stop_live_view
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| match event {
