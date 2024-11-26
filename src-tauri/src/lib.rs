@@ -67,7 +67,6 @@ struct GpuState<'a> {
 //  - create components around the video player that do not have transparent backgrounds
 //
 // IDEAS:
-//  - Set up tauri command to allow stopping the video
 //  - instead of looping inside the command, create another task that just sends the next frame idx
 //    periodically according to the frame rate
 //  ? make some resizable component in the FE, send the size and position down to rust, have that
