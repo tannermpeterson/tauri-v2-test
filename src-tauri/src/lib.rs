@@ -63,12 +63,10 @@ struct GpuState<'a> {
 }
 
 // TODO
-// 1) don't use a new webview
+// 1) don't use a new webview (Is this already done?)
 //  - create components around the video player that do not have transparent backgrounds
 //
 // IDEAS:
-//  - add text input boxes to set min/max threshold and change to blue/red if pixels are
-//    darker/brighter than the threshold. Might need to make the image greyscale to do this
 //  - Set up tauri command to allow stopping the video
 //  - instead of looping inside the command, create another task that just sends the next frame idx
 //    periodically according to the frame rate
